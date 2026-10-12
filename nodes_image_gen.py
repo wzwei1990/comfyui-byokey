@@ -42,7 +42,8 @@ GPT_IMAGE_MODELS = [
     for m in os.environ.get(
         "BYOKEY_GPT_IMAGE_MODELS",
         "gpt-image-2,gpt-image-1.5,gpt-image-1,"
-        "gpt-image-2.5-all,gpt-image-2.5-sunburst-vip,gpt-image-2.5-flare-vip",
+        "gpt-image-2.5-all,gpt-image-2.5-sunburst-vip,gpt-image-2.5-flare-vip,"
+        "doubao-seedream-5-0-pro,doubao-seedream-5-0-pro-260628",
     ).split(",")
     if m.strip()
 ]
