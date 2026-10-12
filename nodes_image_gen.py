@@ -30,7 +30,7 @@ from .utils import (
 )
 
 # Model id list, matching the official OpenAIGPTImageNodeV2 DynamicCombo options.
-GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-1.5", "gpt-image-1"]
+GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-2.5-all", "gpt-image-2.5-sunburst-vip", "gpt-image-2.5-flare-vip"]
 
 # Size options. gpt-image-2 supports the full set incl. "Custom"; the legacy
 # gpt-image-1 / gpt-image-1.5 models only support the first four base sizes.
@@ -339,7 +339,7 @@ class BYOKey_ImageGen:
 
         # Resolve size / custom resolution.
         if size == "Custom":
-            if model != "gpt-image-2":
+            if not str(model).startswith("gpt-image-2"):
                 raise ValueError("Custom resolution is only supported by the gpt-image-2 model")
             size = _validate_custom_size(custom_width, custom_height)
         elif model in ("gpt-image-1", "gpt-image-1.5"):
