@@ -15,6 +15,8 @@ Generation is JSON; editing (when reference images are supplied) is multipart.
 Response (``OpenAIImageGenerationResponse``): ``{"data": [{"b64_json"|"url", ...}]}``.
 """
 import base64
+import json
+import os
 from io import BytesIO
 
 import numpy as np
@@ -30,7 +32,20 @@ from .utils import (
 )
 
 # Model id list, matching the official OpenAIGPTImageNodeV2 DynamicCombo options.
-GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-2.5-all", "gpt-image-2.5-sunburst-vip", "gpt-image-2.5-flare-vip"]
+# Model names shown in the node's `model` dropdown. ComfyUI validates COMBO values
+# strictly (`value_not_in_list`), so every third-party relay's model name must be
+# listed here. Override with the BYOKEY_GPT_IMAGE_MODELS env var (comma separated)
+# to switch relays without editing this file — e.g. to keep several relays at once,
+# list the union of their model names.
+GPT_IMAGE_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "BYOKEY_GPT_IMAGE_MODELS",
+        "gpt-image-2,gpt-image-1.5,gpt-image-1,"
+        "gpt-image-2.5-all,gpt-image-2.5-sunburst-vip,gpt-image-2.5-flare-vip",
+    ).split(",")
+    if m.strip()
+]
 
 # Size options. gpt-image-2 supports the full set incl. "Custom"; the legacy
 # gpt-image-1 / gpt-image-1.5 models only support the first four base sizes.
@@ -263,6 +278,21 @@ class BYOKey_ImageGen:
                     "MASK",
                     {"tooltip": "Optional inpaint mask (white areas replaced). Requires exactly one reference image."},
                 ),
+                "relay_mode": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Generic relay / third-party mode. Sends the minimal OpenAI-compatible body and passes reference images as the JSON `image` field on /images/generations (Ark / Seedream style, no /images/edits). Also lifts the client-side Custom-size model guard. Leave off for OpenAI / gpt-image relays.",
+                    },
+                ),
+                "extra_body_json": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": 'Extra JSON fields merged into the request body, e.g. {"watermark": false} for Volcengine Ark or {"thinking": true} for Seedream 5 Pro with reference images. Applies in both modes.',
+                    },
+                ),
             },
         }
 
@@ -288,6 +318,8 @@ class BYOKey_ImageGen:
         style="natural",
         image=None,
         mask=None,
+        relay_mode=False,
+        extra_body_json="",
     ):
         validate_prompt(prompt, min_length=1)
 
@@ -307,6 +339,8 @@ class BYOKey_ImageGen:
             custom_height,
             image,
             mask,
+            relay_mode,
+            extra_body_json,
         )
 
     # ----------------------------------------------------------------- #
@@ -327,6 +361,8 @@ class BYOKey_ImageGen:
         custom_height,
         image,
         mask,
+        relay_mode=False,
+        extra_body_json="",
     ):
         # GPT Image quality is low/medium/high; coerce DALL-E-style values.
         if quality in ("standard", "hd"):
@@ -337,9 +373,22 @@ class BYOKey_ImageGen:
         if mask is not None and not flat_images:
             raise ValueError("Cannot use a mask without an input image")
 
+        # Extra body fields (both modes). Third-party relays often need vendor
+        # extensions the OpenAI schema has no field for (Ark: watermark / thinking).
+        extra = {}
+        if str(extra_body_json or "").strip():
+            try:
+                extra = json.loads(extra_body_json)
+            except Exception as exc:
+                raise ValueError(f"extra_body_json is not valid JSON: {exc}") from exc
+            if not isinstance(extra, dict):
+                raise ValueError('extra_body_json must be a JSON object, e.g. {"watermark": false}')
+
         # Resolve size / custom resolution.
         if size == "Custom":
-            if not str(model).startswith("gpt-image-2"):
+            # In relay mode the model guard is dropped: it is a client-side OpenAI
+            # restriction, and third-party relays validate the size themselves.
+            if not relay_mode and not str(model).startswith("gpt-image-2"):
                 raise ValueError("Custom resolution is only supported by the gpt-image-2 model")
             size = _validate_custom_size(custom_width, custom_height)
         elif model in ("gpt-image-1", "gpt-image-1.5"):
@@ -351,6 +400,26 @@ class BYOKey_ImageGen:
 
         headers = {"Authorization": f"Bearer {api_key}"}
 
+        if relay_mode:
+            # Minimal OpenAI-compatible body; reference images go through the JSON
+            # `image` field (URL or data URL) on /images/generations. Relays such as
+            # Volcengine Ark implement image-to-image this way and have no /images/edits.
+            relay_body = {"model": model, "prompt": prompt, "size": size}
+            relay_body.update(extra)
+            if flat_images:
+                data_urls = []
+                for one in flat_images:
+                    buf = _tensor_to_png_bytes(one)
+                    data_urls.append(
+                        "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+                    )
+                relay_body["image"] = data_urls[0] if len(data_urls) == 1 else data_urls
+            relay_headers = dict(headers)
+            relay_headers["Content-Type"] = "application/json"
+            relay_url = f"{base_url.rstrip('/')}/images/generations"
+            relay_resp = run_async(http_request("POST", relay_url, relay_headers, json_data=relay_body))
+            return (run_async(_response_to_image_tensor(relay_resp)),)
+
         # Request body fields match OpenAIImageGenerationRequest / OpenAIImageEditRequest.
         body = {
             "model": model,
@@ -361,6 +430,8 @@ class BYOKey_ImageGen:
             "size": size,
             "moderation": "low",
         }
+
+        body.update(extra)
 
         if flat_images:
             resp = run_async(
@@ -380,8 +451,8 @@ class BYOKey_ImageGen:
 
         form = aiohttp.FormData()
         for key, value in body.items():
-            if value is None:
-                continue
+            if value is None or isinstance(value, (dict, list)):
+                continue  # non-scalars can only travel in a JSON body
             form.add_field(key, str(value))
 
         # Field name is "image" for a single reference, "image[]" for multiple,
